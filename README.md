@@ -1,3 +1,7 @@
+<img src="./ttl_analysis_code_tag_probability_evolution.png" width="400px"></img>
+
+<img src="./ttl_analysis_code_tag_rank_evolution.png" width="400px"></img>
+
 <img src="./fig2.png" width="400px"></img>
 
 <img src="./fig1.png" width="400px"></img>
