@@ -1,5 +1,7 @@
+# FILE: titans_pytorch/neural_memory.py
+
 from __future__ import annotations
-from typing import Callable
+from typing import Callable, Dict # Added Dict
 
 import math
 from functools import partial
@@ -17,31 +19,31 @@ from tensordict import TensorDict
 
 from assoc_scan import AssocScan
 
+# Assuming ResidualNorm is either defined here or correctly in memory_models.py
+class ResidualNorm(Module):
+    def __init__(
+        self,
+        dim: int,
+        model: Module,
+        norm_eps: float = 1e-6
+    ):
+        super().__init__()
+        self.model = model
+        self.norm = nn.LayerNorm(dim, eps=norm_eps)
+
+    def forward(self, x: Tensor, **kwargs) -> Tensor:
+        return self.norm(x + self.model(x, **kwargs))
+
+
 from titans_pytorch.memory_models import(
-    MemoryMLP,
-    ResidualNorm
+    MemoryMLP
 )
 
 import einx
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange, Reduce
 
-"""
-ein notation:
-b - batch
-h - heads
-bh - batch and heads
-n - sequence
-d - feature dimension
-c - intra-chunk
-w - num memory network weight parameters
-o - momentum orders
-u - key / value updates - allowing a token to emit multiple key / values
-"""
-
 LinearNoBias = partial(Linear, bias = False)
-
-# neural mem state related
 
 NeuralMemState = namedtuple('NeuralMemState', [
     'seq_index',
@@ -49,16 +51,25 @@ NeuralMemState = namedtuple('NeuralMemState', [
     'cache_store_segment',
     'states',
     'updates',
+    'memory_weights_updated_in_call' # Added field
 ])
 
 def mem_state_detach(
     state: NeuralMemState
 ):
     assert isinstance(state, NeuralMemState)
-    state = tree_map(lambda t: t.detach() if is_tensor(t) else t, tuple(state))
-    return NeuralMemState(*state)
+    # Make sure to handle the new field if it's a tensor (it's a bool, so fine)
+    state_tuple = tuple(state)
+    detached_elements = []
+    for item in state_tuple:
+        if is_tensor(item):
+            detached_elements.append(item.detach())
+        elif isinstance(item, TensorDict):
+            detached_elements.append(item.detach())
+        else:
+            detached_elements.append(item)
+    return NeuralMemState(*detached_elements)
 
-# functions
 
 def exists(v):
     return v is not None
@@ -80,12 +91,8 @@ def divisible_by(num, den):
 
 def safe_cat(inputs, dim = -2):
     inputs = tuple(filter(exists, inputs))
-
-    if len(inputs) == 0:
-        return None
-    elif len(inputs) == 1:
-        return inputs[0]
-
+    if len(inputs) == 0: return None
+    if len(inputs) == 1: return inputs[0]
     return cat(inputs, dim = dim)
 
 def is_empty_tensor(t):
@@ -116,105 +123,73 @@ def pad_at_dim(t, pad, dim = -1, value = 0.):
 
 def pack_one_with_inverse(t, pattern):
     packed, packed_shape = pack([t], pattern)
-
     def inverse(out, inv_pattern = None):
         inv_pattern = default(inv_pattern, pattern)
         return unpack(out, packed_shape, inv_pattern)[0]
-
     return packed, inverse
 
 def Sequential(*modules):
     modules = [*filter(exists, modules)]
-
-    if len(modules) == 0:
-        return nn.Identity()
-
-    if len(modules) == 1:
-        return modules[0]
-
+    if len(modules) == 0: return nn.Identity()
+    if len(modules) == 1: return modules[0]
     return nn.Sequential(*modules)
-
-# softclamping gradients
 
 def softclamp_max(t, max_value):
     half_max_value = max_value / 2
     return ((t / half_max_value).tanh() * half_max_value) + half_max_value
 
 def softclamp_grad_norm(t, max_value):
-    if is_empty_tensor(t):
-        return t
-
-    t, inverse = pack_one_with_inverse(t, 'bn *')
-
-    norm = t.norm(dim = -1, keepdim = True)
+    if is_empty_tensor(t): return t
+    t_packed, inverse = pack_one_with_inverse(t, 'bn *')
+    norm = t_packed.norm(dim = -1, keepdim = True)
     clamped_norm = softclamp_max(norm, max_value)
+    t_packed = t_packed * (clamped_norm / norm.clamp(min=1e-6)) # Added clamp for stability
+    return inverse(t_packed)
 
-    t = t * (clamped_norm / norm)
-    return inverse(t)
-
-# multi head rmsnorm
+def l2norm(t, eps=1e-12, dim=-1):
+    return t * torch.rsqrt(t.pow(2).sum(dim=dim, keepdim=True) + eps)
 
 class MultiheadRMSNorm(Module):
-    def __init__(self, dim, heads):
+    def __init__(self, dim, heads, eps=1e-6): # Added eps
         super().__init__()
-        self.rmsnorm = nn.RMSNorm(dim, elementwise_affine = False)
+        self.rmsnorm = nn.RMSNorm(dim, eps=eps, elementwise_affine = False) # Use eps
         self.gamma = Parameter(torch.zeros(heads, 1, dim))
-
     def forward(self, x):
         return self.rmsnorm(x) * (self.gamma + 1.)
 
-# chunk pooling
-
 class AveragePool(Module):
-    def __init__(
-        self,
-        chunk_size
-    ):
+    def __init__(self, chunk_size):
         super().__init__()
         self.chunk_size = chunk_size
-
-    def forward(
-        self,
-        x,
-        chunk_size = None
-    ):
+    def forward(self, x, chunk_size = None):
         chunk_size = default(chunk_size, self.chunk_size)
+        if x.ndim == 4: x = x.squeeze(0) # Assuming first dim is view if 4D
+        assert x.ndim == 3, f"Input to AveragePool must be 3D (b n d), got {x.ndim}D"
+        if x.shape[1] == 0 : return x # Handle empty sequence
+        if x.shape[1] % chunk_size != 0: # Pad if not divisible
+            padding = chunk_size - (x.shape[1] % chunk_size)
+            x = pad_at_dim(x, (0, padding), dim=1)
         return reduce(x, 'b (n c) d -> b n d', 'mean', c = chunk_size)
 
 class AttentionPool(Module):
-    def __init__(
-        self,
-        dim,
-        chunk_size
-    ):
-        """
-        taken from Enformer https://www.nature.com/articles/s41592-021-01252-x , in turn taken from somewhere else
-        """
+    def __init__(self, dim, chunk_size):
         super().__init__()
         self.chunk_size = chunk_size
         self.to_attn_logits = nn.Linear(dim, dim)
-
-        # default to average pool
-
         nn.init.zeros_(self.to_attn_logits.weight)
         nn.init.zeros_(self.to_attn_logits.bias)
-
-    def forward(
-        self,
-        x,
-        chunk_size = None
-    ):
+    def forward(self, x, chunk_size = None):
         chunk_size = default(chunk_size, self.chunk_size)
-
-        x = rearrange(x, 'b (n c) d -> b n c d', c = chunk_size)
-
-        attn_logits = self.to_attn_logits(x)
-
+        if x.ndim == 4: x = x.squeeze(0) # Assuming first dim is view if 4D
+        assert x.ndim == 3, f"Input to AttentionPool must be 3D (b n d), got {x.ndim}D"
+        if x.shape[1] == 0 : return x # Handle empty sequence
+        if x.shape[1] % chunk_size != 0: # Pad if not divisible
+            padding = chunk_size - (x.shape[1] % chunk_size)
+            x = pad_at_dim(x, (0, padding), dim=1)
+        x_rearranged = rearrange(x, 'b (n c) d -> b n c d', c = chunk_size)
+        attn_logits = self.to_attn_logits(x_rearranged)
         attn = attn_logits.softmax(dim = -2)
-
-        return reduce(x * attn, 'b n c d -> b n d', 'sum')
-
-# main neural memory
+        return reduce(x_rearranged * attn, 'b n c d -> b n d', 'sum')
 
 def default_adaptive_step_transform(adaptive_step, max_lr = 1e-2):
     return adaptive_step.sigmoid() * max_lr
@@ -233,20 +208,22 @@ class NeuralMemory(Module):
         model: Module | None = None,
         store_memory_loss_fn: Callable = default_loss_fn,
         adaptive_step_transform: Callable | None = None,
-        default_step_transform_max_lr = 1.,
-        per_parameter_lr_modulation = False, # allow outer network to control learning rate per weight matrix of memory network
-        max_mem_layer_modulation = 1., # max of 10.
+        default_step_transform_max_lr = 1e-2,
+        per_parameter_lr_modulation = False,
+        max_mem_layer_modulation = 1.,
         per_head_learned_parameters = True,
         attn_pool_chunks = False,
         momentum = True,
         momentum_order = 1,
         learned_momentum_combine = False,
         learned_combine_include_zeroth = False,
-        num_kv_per_token = 1, # whether a single token can do multiple updates to the memory model
-        qkv_receives_diff_views = False, # to address an issue raised by a phd student (who will be credited if experiments are green). basically the issue raised is that the memory MLP is only learning Wk @ Wv linear mapping and that may not be expressive enough. we will use hyper connections to allow the network to choose different previous layer inputs as keys / values and see if that does anything
+        num_kv_per_token = 1,
+        qkv_receives_diff_views = False,
+        norm_eps: float = 1e-6,
         pre_rmsnorm = True,
         post_rmsnorm = False,
         qk_rmsnorm = False,
+        qk_l2norm = True,
         max_grad_norm: float | None = None,
         use_accelerated_scan = False,
         activation: Module | None = None,
@@ -255,158 +232,103 @@ class NeuralMemory(Module):
         init_decay_bias = None,
         accept_weight_residual = False,
         gated_transition = False,
-        mem_model_norm_add_residual = True, # by default, layernorm output and add residual as proposed in TTT paper, but could be removed
+        init_transition_gate_bias: float = -5.0, # Added parameter with default
+        mem_model_norm_add_residual = True,
         default_model_kwargs: dict = dict(
             depth = 2,
             expansion_factor = 4.
         )
     ):
         super().__init__()
+        self.dim = dim
         dim_head = default(dim_head, dim)
         assert not (heads == 1 and dim_head != dim)
 
         self.retrieve_chunk_size, self.store_chunk_size = pair(chunk_size)
 
-        # batch size
-
         if exists(batch_size):
             assert divisible_by(batch_size, self.store_chunk_size)
-
         self.batch_size = batch_size
-
-        # associative scan
 
         self.assoc_scan = AssocScan(use_accelerated = use_accelerated_scan)
 
-        # key values receiving different views
-
         self.qkv_receives_diff_views = qkv_receives_diff_views
 
-        # norms
+        self.retrieve_norm = nn.RMSNorm(dim, eps=norm_eps) if pre_rmsnorm else nn.Identity()
+        self.store_norm = nn.RMSNorm(dim, eps=norm_eps) if pre_rmsnorm else nn.Identity()
+        self.multihead_rmsnorm = MultiheadRMSNorm(dim_head, heads, eps=norm_eps) if post_rmsnorm else nn.Identity()
 
-        self.retrieve_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
-        self.store_norm = nn.RMSNorm(dim) if pre_rmsnorm else nn.Identity()
+        self.qk_l2norm = qk_l2norm
+        self.qk_rmsnorm = qk_rmsnorm
+        if self.qk_rmsnorm and not self.qk_l2norm:
+            self.q_norm_module = MultiheadRMSNorm(dim_head, heads, eps=norm_eps)
+            self.k_norm_module = MultiheadRMSNorm(dim_head, heads, eps=norm_eps)
+        else:
+            self.q_norm_module = nn.Identity()
+            self.k_norm_module = nn.Identity()
 
-        self.multihead_rmsnorm = MultiheadRMSNorm(dim_head, heads) if post_rmsnorm else nn.Identity()
-
-        self.q_norm = MultiheadRMSNorm(dim_head, heads) if qk_rmsnorm else nn.Identity()
-        self.k_norm = MultiheadRMSNorm(dim_head, heads) if qk_rmsnorm else nn.Identity()
-
-        # maybe multi-headed
 
         dim_inner = dim_head * heads
-
         self.heads = heads
-
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.split_kv_heads = Rearrange('b n (h u d) -> b h (n u) d', h = heads, u = num_kv_per_token)
-
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
-        self.combine_heads = LinearNoBias(dim_inner, dim) if heads > 1 else nn.Identity()
+        self.combine_heads = Linear(dim_inner, dim) if heads > 1 else nn.Identity()
 
         self.retrieve_gate = Sequential(
-            LinearNoBias(dim, heads),
+            Linear(dim, heads),
             Rearrange('b n h -> b h n 1'),
             nn.Sigmoid()
         ) if heads > 1 else None
 
-        # memory model
-
         if not exists(model):
-            model = MemoryMLP(dim_head, **default_model_kwargs)
-
-        # validate memory model
+            model = MemoryMLP(dim=dim_head, **default_model_kwargs)
 
         assert not exists(next(model.buffers(), None)), 'model cannot have buffers for now'
-
         test_shape = (3, 2, dim_head)
-
         with torch.no_grad():
             try:
                 test_input = torch.randn(test_shape)
                 mem_model_output = model(test_input)
             except:
                 raise RuntimeError(f'memory model unable to accept a tensor of shape {test_shape}')
-
             assert mem_model_output.shape == test_shape, 'output of memory model needs to be same shape as input'
 
-        # the memory is the weights of the model
-
-        if mem_model_norm_add_residual:
-            model = ResidualNorm(dim = dim_head, model = model)
+        if mem_model_norm_add_residual and not isinstance(model, ResidualNorm):
+            model = ResidualNorm(dim = dim_head, model = model, norm_eps=norm_eps)
 
         self.memory_model = model
+        mem_model_params_dict = dict(self.memory_model.named_parameters())
+        self.num_memory_parameter_tensors = len(mem_model_params_dict)
+        self.memory_model_parameter_names = [*mem_model_params_dict.keys()]
 
-        mem_model_params = dict(model.named_parameters())
+        cloned_params_for_list = []
+        for name, p_original_shape in mem_model_params_dict.items():
+            p_data = p_original_shape.data.clone()
+            if per_head_learned_parameters:
+                p_data = repeat(p_data, '... -> h ...', h=heads)
+            cloned_params_for_list.append(Parameter(p_data))
 
-        self.num_memory_parameter_tensors = len(mem_model_params)
-
-        self.memory_model_parameter_names = [*mem_model_params.keys()]
-
-        memory_model_parameters = [*mem_model_params.values()]
-
-        if per_head_learned_parameters:
-            memory_model_parameters = [repeat(p, '... -> h ...', h = heads) for p in memory_model_parameters]
-
-        self.init_weight_shape = [p.shape for p in memory_model_parameters]
-
-        self.memory_model_parameters = ParameterList(memory_model_parameters)
+        self.memory_model_parameters = ParameterList(cloned_params_for_list)
+        self.init_weight_shape = [p.shape for p in self.memory_model_parameters]
         self.per_head_learned_parameters = per_head_learned_parameters
 
-        # the chunk size within the paper where adaptive step, momentum, weight decay are shared
+        self.activation_for_qkv = default(activation, nn.SiLU())
 
-        self.chunk_size = chunk_size
-
-        # prepare function for per sample gradients from model above, using torch.func
-
-        def forward_and_loss(params, inputs, loss_weights, target):
-            pred = functional_call(self.memory_model, params, inputs)
-            loss = self.store_memory_loss_fn(pred, target) # simple mse loss in paper - eq (12) - |M(k) - v|²
-            weighted_loss = loss * loss_weights
-            return weighted_loss.sum(), loss
-
-        # two functions
-
-        grad_fn = grad(forward_and_loss, has_aux = True)
-
-        self.per_sample_grad_fn = vmap(grad_fn, in_dims = (0, 0, 0, 0))
-
-        # queries for retrieving from the model
-
-        self.to_queries = Sequential(LinearNoBias(dim, dim_inner), activation)
-
-        # keys and values for storing to the model
-
+        self.to_queries = Sequential(LinearNoBias(dim, dim_inner), self.activation_for_qkv)
         assert num_kv_per_token > 0
-
-        self.to_keys = Sequential(
-            LinearNoBias(dim, dim_inner * num_kv_per_token),
-            activation,
-        )
-
-        self.to_values = Sequential(
-            LinearNoBias(dim, dim_inner * num_kv_per_token),
-            activation,
-        )
+        self.to_keys = Sequential(LinearNoBias(dim, dim_inner * num_kv_per_token), self.activation_for_qkv)
+        self.to_values = Sequential(LinearNoBias(dim, dim_inner * num_kv_per_token), self.activation_for_qkv)
 
         self.store_memory_loss_fn = store_memory_loss_fn
-
         self.num_kv_per_token = num_kv_per_token
 
-        # `chunk_size` refers to chunk size used for storing to memory model weights
-
-        chunk_size = self.store_chunk_size
-
-        # whether to use averaging of chunks, or attention pooling
-
-        assert not (attn_pool_chunks and chunk_size == 1), '`attn_pool_chunks` cannot be set to True if `chunk_size` is set to 1'
-
+        store_chunk_size_val = self.store_chunk_size
+        assert not (attn_pool_chunks and store_chunk_size_val == 1), '`attn_pool_chunks` cannot be set to True if `chunk_size` is set to 1'
         if not attn_pool_chunks:
-            self.reduce_to_chunk_rep = AveragePool(chunk_size = chunk_size)
+            self.reduce_to_chunk_rep = AveragePool(chunk_size = store_chunk_size_val)
         else:
-            self.reduce_to_chunk_rep = AttentionPool(dim, chunk_size = chunk_size)
-
-        # learned adaptive learning rate
+            self.reduce_to_chunk_rep = AttentionPool(dim, chunk_size = store_chunk_size_val)
 
         self.to_adaptive_step = Sequential(
             nn.Linear(dim, heads * num_kv_per_token),
@@ -415,45 +337,32 @@ class NeuralMemory(Module):
 
         if not exists(adaptive_step_transform):
             adaptive_step_transform = partial(default_adaptive_step_transform, max_lr = default_step_transform_max_lr)
-
         self.adaptive_step_transform = adaptive_step_transform
-
-        # momentum related
 
         self.to_momentum = Sequential(
             nn.Linear(dim, heads * momentum_order),
             Rearrange('b n (h o) -> o (b h) n 1', o = momentum_order)
         ) if momentum else None
-
         self.momentum_order = momentum_order
         self.to_learned_momentum_combine = None
-
         if learned_momentum_combine:
             assert momentum
-            assert momentum_order > 1, 'only second order momentum allowed for now, but may allow learned combination of zeroth'
-
+            momentum_order_comb = momentum_order
             if learned_combine_include_zeroth:
-                momentum_order += 1
-
+                momentum_order_comb += 1
             self.to_learned_momentum_combine = Sequential(
-                nn.Linear(dim, heads * momentum_order),
-                Rearrange('b n (h o) -> o (b h) n', h = heads),
+                nn.Linear(dim, heads * momentum_order_comb),
+                Rearrange('b n (h o) -> o (b h) n', h = heads, o=momentum_order_comb),
                 nn.Softmax(dim = 0),
             )
-
             self.learned_combine_include_zeroth = learned_combine_include_zeroth
-
-        # per layer learning rate modulation
 
         self.to_layer_modulation = Sequential(
             nn.Linear(dim, heads * self.num_memory_parameter_tensors),
             Rearrange('b n (h w) -> w (b h) n', h = heads),
             nn.Sigmoid()
         ) if per_parameter_lr_modulation else None
-
         self.max_mem_layer_modulation = max_mem_layer_modulation
-
-        # learned weight residual
 
         self.to_learned_weight_residual_mix = Sequential(
             nn.Linear(dim, heads),
@@ -461,568 +370,542 @@ class NeuralMemory(Module):
             nn.Sigmoid()
         ) if accept_weight_residual else None
 
-        # allow for softclamp the gradient norms for storing memories
-
         self.max_grad_norm = max_grad_norm
-
-        # weight decay factor
 
         self.to_decay_factor = Sequential(
             nn.Linear(dim, heads),
             Rearrange('b n h -> (b h) n 1')
         )
 
-        # learned transition, as seeing instability when decreasing neural mem batch size
-        # perhaps it can slowly learn to adjust from early residual to fully transitioning to new weights every batch size
-
-        self.transition_gate = nn.Parameter(tensor(-5.)) if gated_transition else None
-
-        # inits
+        self.transition_gate = nn.Parameter(tensor(init_transition_gate_bias)) if gated_transition else None # Use init_transition_gate_bias
 
         if exists(init_adaptive_step_bias):
-            linear = self.to_adaptive_step[0]
-            nn.init.zeros_(linear.weight)
-            nn.init.constant_(linear.bias, init_adaptive_step_bias)
+            if isinstance(self.to_adaptive_step[0], nn.Linear):
+                linear = self.to_adaptive_step[0]
+                nn.init.zeros_(linear.weight)
+                nn.init.constant_(linear.bias, init_adaptive_step_bias)
 
-        if exists(init_momentum_bias):
-            linear = self.to_momentum[0]
-            nn.init.zeros_(linear.weight)
-            nn.init.constant_(linear.bias, init_momentum_bias)
+        if exists(self.to_momentum) and exists(init_momentum_bias):
+             if isinstance(self.to_momentum[0], nn.Linear):
+                linear = self.to_momentum[0]
+                nn.init.zeros_(linear.weight)
+                nn.init.constant_(linear.bias, init_momentum_bias)
 
         if exists(init_decay_bias):
-            linear = self.to_decay_factor[0]
-            nn.init.zeros_(linear.weight)
-            nn.init.constant_(linear.bias, init_decay_bias)
-
-        # maybe use accelerated scan
+             if isinstance(self.to_decay_factor[0], nn.Linear):
+                linear = self.to_decay_factor[0]
+                nn.init.zeros_(linear.weight)
+                nn.init.constant_(linear.bias, init_decay_bias)
 
         self.use_accelerated_scan = use_accelerated_scan
-
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
 
     @property
     def memory_model_parameter_dict(self):
         return TensorDict(dict(zip(self.memory_model_parameter_names, self.memory_model_parameters)))
 
-    def init_weights(
-        self,
-        batch,
-    ):
+    def init_weights(self, batch):
+        source_param_dict = self.memory_model_parameter_dict
         if self.per_head_learned_parameters:
-            weights = repeat_dict_values(self.memory_model_parameter_dict, 'h ... -> (b h) ...', b = batch)
+            weights = repeat_dict_values(source_param_dict, 'h ... -> (b h) ...', b = batch)
         else:
-            weights = repeat_dict_values(self.memory_model_parameter_dict, '... -> bh ...', bh = batch * self.heads)
-
+            weights = repeat_dict_values(source_param_dict, '... -> bh ...', bh = batch * self.heads)
         return weights
 
-    def init_momentum(
-        self,
-        batch,
-    ):
-        zeros = self.memory_model_parameter_dict.clone().zero_()
-
+    def init_momentum(self, batch):
+        zeros_template = self.memory_model_parameter_dict.apply(lambda t: torch.zeros_like(t))
         if self.per_head_learned_parameters:
-            zeros = repeat_dict_values(zeros, 'h ... -> o (b h) ...', b = batch, o = self.momentum_order)
+            zeros = repeat_dict_values(zeros_template, 'h ... -> o (b h) ...', b = batch, o = self.momentum_order)
         else:
-            zeros = repeat_dict_values(zeros, '... -> o bh ...', bh = batch * self.heads, o = self.momentum_order)
-
+            zeros = repeat_dict_values(zeros_template, '... -> o bh ...', bh = batch * self.heads, o = self.momentum_order)
         return zeros
+
+    def _forward_and_loss_for_grad(self, params_slice: Dict[str, Tensor], inputs: Tensor, loss_weights: Tensor, target: Tensor):
+        pred = functional_call(self.memory_model, params_slice, (inputs,))
+        loss = self.store_memory_loss_fn(pred, target)
+        weighted_loss = loss * loss_weights
+        return weighted_loss.sum(), loss
 
     def store_memories(
         self,
         seq,
+        keys_values_views_seq=None,
         weights: dict[str, Tensor] | None = None,
         past_state: tuple[dict[str, Tensor], dict[str, Tensor]] | None = None,
         seq_index = 0,
         prev_weights = None,
         mask: Tensor | None = None,
-        return_surprises = True
+        return_surprises = True,
+        disable_ttl: bool = False
     ):
-        if self.qkv_receives_diff_views:
-            _, batch, seq_len = seq.shape[:3]
-        else:
-            batch, seq_len = seq.shape[:2]
+        assert seq.ndim == 3, f"Input 'seq' to store_memories must be 3D, got {seq.ndim}D"
+        batch, seq_len_local = seq.shape[:2]
 
-        # shapes and variables
+        heads, configured_chunk_size_for_internal_grad, num_updates = self.heads, self.store_chunk_size, self.num_kv_per_token
 
-        heads, chunk_size, num_updates = self.heads, self.store_chunk_size, self.num_kv_per_token
+        current_processing_chunk_size_for_grad_calc = configured_chunk_size_for_internal_grad
+        if not disable_ttl and seq_len_local > 0 and seq_len_local < configured_chunk_size_for_internal_grad:
+            current_processing_chunk_size_for_grad_calc = seq_len_local
+        
+        effective_round_down_seq_len = round_down_multiple(seq_len_local, current_processing_chunk_size_for_grad_calc)
 
-        # curtail sequence by multiple of the chunk size
-        # only a complete chunk of the sequence provides the memory for the next chunk
+        if disable_ttl or effective_round_down_seq_len == 0:
+             remainder_if_skipped = seq
+             if effective_round_down_seq_len == 0 and not disable_ttl and seq_len_local > 0:
+                 if seq_len_local == 0:
+                    remainder_if_skipped = torch.empty_like(seq[:, :0, :])
 
-        round_down_seq_len = round_down_multiple(seq_len, chunk_size)
-        num_chunks = round_down_seq_len // chunk_size
 
-        seq, remainder = seq[..., :round_down_seq_len, :], seq[..., round_down_seq_len:, :]
+             if not exists(weights): weights = self.init_weights(batch)
+             weights = TensorDict(weights)
 
-        next_seq_len_index = seq_index + round_down_seq_len
+             current_past_last_applied_deltas, current_past_last_momentum = default(
+                 past_state,
+                 (weights.apply(lambda t: torch.zeros_like(t) if t.numel() > 0 else t),
+                  self.init_momentum(batch))
+             )
+             if not isinstance(current_past_last_applied_deltas, TensorDict): current_past_last_applied_deltas = TensorDict(current_past_last_applied_deltas)
+             if not isinstance(current_past_last_momentum, TensorDict): current_past_last_momentum = TensorDict(current_past_last_momentum)
 
-        # init weights if needed
-        # weights of the memory network
+             updates_data = weights.apply(lambda t: torch.zeros_like(t).unsqueeze(1) if t.numel() > 0 else t.unsqueeze(1))
+             next_store_state = NeuralMemState(seq_index + seq_len_local, weights, remainder_if_skipped, (current_past_last_applied_deltas, current_past_last_momentum), updates_data, False)
+
+
+             if not return_surprises: return updates_data, next_store_state
+             zero_loss_shape = (batch, heads, seq_len_local * num_updates) if seq_len_local > 0 else (batch, heads, 0)
+             zero_loss = torch.zeros(zero_loss_shape, device=seq.device, dtype=seq.dtype)
+             zero_lr_shape = (batch, heads, seq_len_local * num_updates) if seq_len_local > 0 else (batch, heads, 0)
+             zero_lr = torch.zeros(zero_lr_shape, device=seq.device, dtype=seq.dtype)
+             return updates_data, next_store_state, (zero_loss, zero_lr)
+
+        seq_proc, remainder = seq[:, :effective_round_down_seq_len, :], seq[:, effective_round_down_seq_len:, :]
+        num_chunks_for_grad_calc = effective_round_down_seq_len // current_processing_chunk_size_for_grad_calc
+        next_seq_len_index = seq_index + effective_round_down_seq_len
 
         if not exists(weights):
             weights = self.init_weights(batch)
-
         weights = TensorDict(weights)
 
-        # allow for neural memory of a previous layer to influence surprise of current layer
+        weights_for_surprise = repeat_dict_values(weights, 'bh ... -> (bh n) ...', n = num_chunks_for_grad_calc)
 
-        weights_for_surprise = repeat_dict_values(weights, 'b ... -> b n ...', n = num_chunks)
+        normed_seq_proc = self.store_norm(seq_proc)
+        raw_adaptive_step_values = self.to_adaptive_step(normed_seq_proc)
+        adaptive_lr_transformed = self.adaptive_step_transform(raw_adaptive_step_values)
 
-        # initial norm
+        chunked_seq_for_params = self.reduce_to_chunk_rep(normed_seq_proc, chunk_size = current_processing_chunk_size_for_grad_calc)
+        decay_factor = self.to_decay_factor(chunked_seq_for_params).sigmoid()
 
-        seq = self.store_norm(seq)
-
-        # handle keys and values coming from different sequences from hyper connection
-
-        values_seq = seq
-
-        if self.qkv_receives_diff_views:
-            seq, values_seq = seq
-
-        # derive learned hparams for optimization of memory network
-
-        adaptive_lr = self.to_adaptive_step(seq)
-        adaptive_lr = self.adaptive_step_transform(adaptive_lr)
-
-        chunked_seq = self.reduce_to_chunk_rep(seq, chunk_size = chunk_size)
-
-        decay_factor = self.to_decay_factor(chunked_seq).sigmoid()
-
-        need_layer_lr_mod = exists(self.to_layer_modulation) and num_chunks > 0
+        need_layer_lr_mod = exists(self.to_layer_modulation) and num_chunks_for_grad_calc > 0
         has_momentum = exists(self.to_momentum)
 
         if has_momentum:
-            adaptive_momentum = self.to_momentum(chunked_seq).sigmoid()
-
+            adaptive_momentum = self.to_momentum(chunked_seq_for_params).sigmoid()
             learned_combine = exists(self.to_learned_momentum_combine)
-
             if learned_combine:
-                combine_momentums = self.to_learned_momentum_combine(chunked_seq)
+                combine_momentums = self.to_learned_momentum_combine(chunked_seq_for_params)
 
         if need_layer_lr_mod:
-            layer_lr_mod = self.to_layer_modulation(chunked_seq) * self.max_mem_layer_modulation
+            layer_lr_mod = self.to_layer_modulation(chunked_seq_for_params) * self.max_mem_layer_modulation
 
-        # keys and values
+        keys_seq_for_proj = normed_seq_proc
+        values_seq_for_proj = normed_seq_proc
 
-        keys = self.to_keys(seq)
-        values = self.to_values(values_seq)
+        if exists(keys_values_views_seq):
+            kv_views_proc = keys_values_views_seq[:, :, :effective_round_down_seq_len, :]
+            if kv_views_proc.shape[0] >= 1:
+                keys_seq_for_proj = self.store_norm(kv_views_proc[0])
+            if kv_views_proc.shape[0] >= 2:
+                values_seq_for_proj = self.store_norm(kv_views_proc[1])
+            elif kv_views_proc.shape[0] == 1:
+                 values_seq_for_proj = self.store_norm(kv_views_proc[0])
 
-        # maybe multi head
+        keys = self.to_keys(keys_seq_for_proj)
+        values = self.to_values(values_seq_for_proj)
 
         keys, values = map(self.split_kv_heads, (keys, values))
 
-        # maybe keys rmsnorm
+        if self.qk_l2norm:
+            keys = l2norm(keys)
+        elif self.qk_rmsnorm:
+            keys = self.k_norm_module(keys)
 
-        keys = self.k_norm(keys)
-
-        # take care of chunking
-
-        keys, values = tuple(rearrange(t, 'b h (n c u) d -> (b h n) (c u) d', c = chunk_size, u = num_updates) for t in (keys, values))
-
-        # adaptive lr
-
-        adaptive_lr = rearrange(adaptive_lr, 'b (n c u) -> (b n) (c u)', c = chunk_size, u = num_updates)
-
-        # optionally a storing memories mask can be passed in. if False, will set the learning rate to 0. for those positions
+        keys_for_grad = rearrange(keys, 'b h (n c u) d -> (b h n) (c u) d', c=current_processing_chunk_size_for_grad_calc, u=num_updates)
+        values_for_grad = rearrange(values, 'b h (n c u) d -> (b h n) (c u) d', c=current_processing_chunk_size_for_grad_calc, u=num_updates)
+        adaptive_lr_for_grad_as_loss_weights = rearrange(adaptive_lr_transformed, '(bh) (n c u) -> (bh n) (c u)', c=current_processing_chunk_size_for_grad_calc, u=num_updates, n=num_chunks_for_grad_calc)
 
         if exists(mask):
-            mask = mask[..., :round_down_seq_len]
-            mask = repeat(mask, 'b (n c) -> (b h n) (c u)', h = heads, u = num_updates, c = chunk_size)
+            mask_proc = mask[:, :effective_round_down_seq_len]
+            mask_rearranged = repeat(mask_proc, 'b (n c) -> (b h n) (c u)', h=heads, u=num_updates, c=current_processing_chunk_size_for_grad_calc)
+            adaptive_lr_for_grad_as_loss_weights = torch.where(mask_rearranged, adaptive_lr_for_grad_as_loss_weights, 0.)
 
-            adaptive_lr = torch.where(mask, adaptive_lr, 0.)
-
-        # maybe add previous layer weight
-
-        assert xnor(exists(self.to_learned_weight_residual_mix), exists(prev_weights))
-
+        weights_for_grad_vmap_prep = weights_for_surprise
         if exists(prev_weights):
+            start_idx_global_chunk = math.ceil(seq_index / configured_chunk_size_for_internal_grad)
+            end_idx_global_chunk = start_idx_global_chunk + num_chunks_for_grad_calc
+            
+            prev_weights_chunk = prev_weights.apply(
+                lambda t: t[:, start_idx_global_chunk:end_idx_global_chunk] if t.ndim > 1 and t.shape[1] >= end_idx_global_chunk else torch.zeros_like(t[:, :num_chunks_for_grad_calc] if t.ndim > 1 and t.shape[1] >=num_chunks_for_grad_calc else t.unsqueeze(1).expand(-1, num_chunks_for_grad_calc, *([-1]*(t.ndim-1))).contiguous() )
+            )
 
-            start_index = math.ceil(seq_index / chunk_size)
-            end_index = start_index + num_chunks
-
-            prev_weights = prev_weights.apply(lambda t: t[:, start_index:end_index])
-
-            if exists(self.to_learned_weight_residual_mix) and num_chunks > 0:
-                mix = self.to_learned_weight_residual_mix(chunked_seq)
+            if exists(self.to_learned_weight_residual_mix) and num_chunks_for_grad_calc > 0:
+                mix = self.to_learned_weight_residual_mix(chunked_seq_for_params)
                 mix = rearrange(mix, 'b h n -> (b h) n')
-                prev_weights = prev_weights.apply(lambda t: einx.multiply('bh n, bh n ... -> bh n ...', mix, t))
+                prev_weights_chunk = prev_weights_chunk.apply(lambda t: einx.multiply('bh n, bh n ... -> bh n ...', mix, t))
 
-            weights_for_surprise = weights_for_surprise + prev_weights
+            prev_weights_reshaped = rearrange_dict_values(prev_weights_chunk, 'bh n ... -> (bh n) ...')
+            weights_for_grad_vmap_prep = weights_for_surprise.apply(lambda cur, prev_r: cur + prev_r, prev_weights_reshaped)
+        
+        vmap_grad_fn = grad(self._forward_and_loss_for_grad, has_aux=True)
+        per_sample_grad_fn_local = vmap(vmap_grad_fn, in_dims=(0, 0, 0, 0))
 
-        # flatten batch and time if surprise depends on previous layer memory model
+        grads_dict_vmapped, unweighted_loss_vmapped = per_sample_grad_fn_local(
+            dict(weights_for_grad_vmap_prep), keys_for_grad, adaptive_lr_for_grad_as_loss_weights, values_for_grad
+        )
+        grads = TensorDict(grads_dict_vmapped)
 
-        weights_for_surprise = rearrange_dict_values(weights_for_surprise, 'b n ... -> (b n) ...')
-
-        # get grads and extra auxiliary loss (for backwarding through qkv projection in base neural memory module)
-
-        grads, unweighted_mem_model_loss = self.per_sample_grad_fn(dict(weights_for_surprise), keys, adaptive_lr, values)
-
-        grads = TensorDict(grads)
-
-        # surprises
-
-        adaptive_lr = rearrange(adaptive_lr, '(b h n) c -> b h (n c)', b = batch, h = heads)
-        unweighted_mem_model_loss = rearrange(unweighted_mem_model_loss, '(b h n) c -> b h (n c)', b = batch, h = heads)
-
-        # maybe softclamp grad norm
+        adaptive_lr_reshaped_for_surprise = rearrange(adaptive_lr_transformed, '(b h) (n c u) -> b h (n c u)', b=batch, h=heads, n=num_chunks_for_grad_calc, c=current_processing_chunk_size_for_grad_calc, u=num_updates)
+        unweighted_mem_model_loss_reshaped = rearrange(
+            unweighted_loss_vmapped,
+            '(b h n) (c u) -> b h (n c u)', 
+            b=batch, h=heads, n=num_chunks_for_grad_calc, c=current_processing_chunk_size_for_grad_calc, u=num_updates
+        )
 
         if exists(self.max_grad_norm):
             grads = grads.apply(lambda t: softclamp_grad_norm(t, self.max_grad_norm))
 
-        # restore batch and sequence dimension
+        grads = rearrange_dict_values(grads, '(bh n) ... -> bh n ...', bh=batch*heads, n=num_chunks_for_grad_calc)
 
-        grads = rearrange_dict_values(grads, '(b n) ... -> b n ...', b = batch * heads)
-
-        # maybe per layer modulation
-
-        if need_layer_lr_mod:
-            grads = TensorDict({name: einx.multiply('b h, b h ... -> b h ...', layer_lr_mod, t) for layer_lr_mod, (name, t) in zip(layer_lr_mod, grads.items())})
-
-        # negative gradients, adaptive lr already applied as loss weight
+        if need_layer_lr_mod :
+            new_grads_dict = {}
+            for i, (param_name, grad_tensor) in enumerate(grads.items()):
+                current_mod = layer_lr_mod[i]
+                mod_unsqueezed = current_mod.view(current_mod.shape[0], current_mod.shape[1], *((1,) * (grad_tensor.ndim - 2)))
+                new_grads_dict[param_name] = grad_tensor * mod_unsqueezed
+            grads = TensorDict(new_grads_dict)
 
         surprises = grads.mul(-1)
+        
+        current_past_weights_batch_start, current_past_momentum_chunk_start = default(
+            past_state,
+            (weights.apply(lambda t: torch.zeros_like(t) if t.numel() > 0 else t),
+             self.init_momentum(batch))
+        )
+        if not isinstance(current_past_weights_batch_start, TensorDict): current_past_weights_batch_start = TensorDict(current_past_weights_batch_start)
+        if not isinstance(current_past_momentum_chunk_start, TensorDict): current_past_momentum_chunk_start = TensorDict(current_past_momentum_chunk_start)
 
-        # past states
+        updates_M_values_over_chunks = TensorDict()
+        next_last_M_values_for_batch = TensorDict()
+        next_last_S_values_for_batch = TensorDict()
 
-        if not exists(past_state):
-            # minibatch_init_weight corresponds to W0 in figure 7 of TTT paper
-
-            minibatch_init_weight = weights
-            init_momentum = self.init_momentum(batch)
-
-            past_state = (minibatch_init_weight, init_momentum)
-
-        past_last_update, past_last_momentum = past_state
-
-        # early return if sequence length less than chunk size
-
-        if num_chunks == 0:
-            updates = rearrange_dict_values(weights, 'bh ... -> bh 1 ...')
-            next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, past_state, updates)
-
-            output = (updates, next_store_state)
-
-            if not return_surprises:
-                return output
-
-            return (*output, (unweighted_mem_model_loss, adaptive_lr))
-
-        # momentum + weight decay - momentum is the new contribution, as most linear RNNs have learned forgetting gates
-
-        updates = TensorDict()
-
-        next_last_update = TensorDict()
-        next_last_momentum = TensorDict()
-
-        for (param_name, surprise), (_, last_update) in zip(surprises.items(), past_last_update.items()):
-
-            update = surprise
-
-            # derive momentum with associative scan - eq (10)
+        for (param_name, surprise_param_chunks) in surprises.items():
+            effective_update_for_decay_scan = surprise_param_chunks
 
             if has_momentum:
-                momentum = surprise
+                momentum_deltas_accum = []
+                last_S_param_for_orders = current_past_momentum_chunk_start[param_name]
+                next_S_orders_final_state_for_param = []
 
-                momentums = [] # stores all momentum orders starting with first, to generalize to Nth order momentum
+                for order_idx in range(self.momentum_order):
+                    one_adaptive_momentum_for_order = adaptive_momentum[order_idx]
+                    one_last_S_state_for_order = last_S_param_for_orders[order_idx]
+                    alpha_momentum_scan = rearrange(one_adaptive_momentum_for_order, 'bh n 1 -> bh n')
+                    
+                    momentum_scan_out_for_order = self.assoc_scan(
+                        alpha_momentum_scan, surprise_param_chunks, prev=one_last_S_state_for_order
+                    )
+                    momentum_deltas_accum.append(momentum_scan_out_for_order)
+                    if momentum_scan_out_for_order.numel() > 0 and momentum_scan_out_for_order.shape[1] > 0:
+                        next_S_orders_final_state_for_param.append(momentum_scan_out_for_order[:, -1])
+                    else:
+                        next_S_orders_final_state_for_param.append(one_last_S_state_for_order)
+                
+                momentum_deltas_accum_stacked = stack(momentum_deltas_accum)
+                next_last_S_values_for_batch[param_name] = stack(next_S_orders_final_state_for_param)
 
-                last_momentum = past_last_momentum[param_name]
-
-                # go from first order momentum all the way to the Nth
-
-                for one_adaptive_momentum, one_last_momentum in zip_longest(adaptive_momentum, last_momentum):
-                    momentum = self.assoc_scan(one_adaptive_momentum, momentum, prev = one_last_momentum) # momentum is S / surprise in the paper
-
-                    momentums.append(momentum)
-
-                momentums = stack(momentums)
-
-                next_last_momentum[param_name] = momentums[:, :, -1] # momentums shape is Float['o bh n 1']
-
-                if learned_combine and self.learned_combine_include_zeroth:
-                    # add the original surprise if learned combination of momentums
-                    momentums = cat((rearrange(surprise, '... -> 1 ...'), momentums), dim = 0)
-
-                if not learned_combine:
-                    update = momentums[-1]
+                if learned_combine:
+                    current_momentums_for_combine = momentum_deltas_accum_stacked
+                    if self.learned_combine_include_zeroth:
+                        surprise_param_chunks_expanded = rearrange(surprise_param_chunks, 'bh n ... -> 1 bh n ...')
+                        current_momentums_for_combine = cat((surprise_param_chunks_expanded, momentum_deltas_accum_stacked), dim=0)
+                    effective_update_for_decay_scan = einsum(combine_momentums, current_momentums_for_combine, 'o_comb bh n, o_comb bh n ...P -> bh n ...P')
                 else:
-                    update = einsum(combine_momentums, momentums, 'o b n, o b n ... -> b n ...')
+                    effective_update_for_decay_scan = momentum_deltas_accum_stacked[-1]
+            else:
+                 next_last_S_values_for_batch[param_name] = self.init_momentum(batch)[param_name]
 
-            # use associative scan again for learned forgetting (weight decay) - eq (13)
+            decay_alpha_scan_for_param = rearrange(1. - decay_factor, 'bh n 1 -> bh n')
+            
+            accumulated_M_values_scan_out = self.assoc_scan(
+                decay_alpha_scan_for_param, effective_update_for_decay_scan, prev=current_past_weights_batch_start[param_name]
+            )
 
-            update = self.assoc_scan(1. - decay_factor, update, prev = last_update, remove_prev = False)
+            updates_M_values_over_chunks[param_name] = accumulated_M_values_scan_out
+            if accumulated_M_values_scan_out.numel() > 0 and accumulated_M_values_scan_out.shape[1] > 0:
+                next_last_M_values_for_batch[param_name] = accumulated_M_values_scan_out[:, -1]
+            else:
+                next_last_M_values_for_batch[param_name] = current_past_weights_batch_start[param_name]
 
-            updates[param_name] = update
-            next_last_update[param_name] = update[:, -1]
+        current_call_final_state_for_M_and_S = (next_last_M_values_for_batch, next_last_S_values_for_batch)
 
-        # determine next state for the storing of memories
-
-        next_state = (next_last_update, next_last_momentum)
-
-        next_store_state = NeuralMemState(next_seq_len_index, weights, remainder, next_state, updates)
-
-        # return updates to neural memory at all chunked timesteps + neural mem cache / state to be fed back
+        next_store_state = NeuralMemState(
+            seq_index=next_seq_len_index,
+            weights=weights, 
+            cache_store_segment=remainder,
+            states=current_call_final_state_for_M_and_S,
+            updates=updates_M_values_over_chunks,
+            memory_weights_updated_in_call=False # Will be set in NeuralMemory.forward
+        )
 
         if not return_surprises:
-            return updates, next_store_state
-
-        return updates, next_store_state, (unweighted_mem_model_loss, adaptive_lr)
+            return updates_M_values_over_chunks, next_store_state
+        return updates_M_values_over_chunks, next_store_state, (unweighted_mem_model_loss_reshaped, adaptive_lr_reshaped_for_surprise)
 
     def retrieve_memories(
         self,
         seq,
-        weights: dict[str, Tensor],
+        weights: TensorDict,
     ):
-        chunk_size = self.retrieve_chunk_size
-
-        weights_have_expanded_shape = dict_get_value_shapes(weights) != self.init_weight_shape
-
+        original_seq_for_gate = seq
+        local_retrieve_chunk_size = self.retrieve_chunk_size
+        
         batch, seq_len = seq.shape[:2]
-
-        # auto infer single token decoding, if there are only 1 set of weights and 1 token
-
+        
         is_one_token = seq_len == 1
-        is_one_weight = (not weights_have_expanded_shape) or next(iter(weights.values())).shape[1] == 1
+        if is_one_token: local_retrieve_chunk_size = 1
 
-        is_single_token_decode = is_one_token and is_one_weight
+        need_pad = local_retrieve_chunk_size > 1 and seq_len > 0 and (seq_len % local_retrieve_chunk_size != 0)
+        original_retrieve_seq_len = seq_len
 
-        if is_single_token_decode:
-            chunk_size = 1
-
-        # padding related, for chunked processing
-
-        need_pad = chunk_size > 1 or not is_one_weight
-
+        seq_for_queries = seq
         if need_pad:
-            seq = pad_at_dim(seq, (1, 0), dim = 1)
+            padding_for_chunking = local_retrieve_chunk_size - (seq_len % local_retrieve_chunk_size)
+            seq_for_queries = pad_at_dim(seq, (0, padding_for_chunking), dim=1)
+        
+        if seq_for_queries.shape[1] == 0:
+             return torch.empty(batch, original_retrieve_seq_len, self.dim, device=seq.device, dtype=seq.dtype)
 
-        seq_len_plus_one = seq.shape[-2]
-
-        next_seq_len = round_up_multiple(seq_len_plus_one, chunk_size)
-
-        padding = next_seq_len - seq_len_plus_one
-        seq = pad_at_dim(seq, (0, padding), dim = 1)
-
-        # the parameters of the memory model stores the memories of the key / values
-        # when the MLP has only 1 weight matrix, it is equivalent to `kv` fast weight memories from linear attention literature (recall fetching of memories is q @ (kv)) / schmidhuber's paper
-
-        weights = TensorDict(weights)
-
-        # pre norm
-
-        seq = self.retrieve_norm(seq)
-
-        # sequence Float['b n d'] to queries
-
-        queries = self.to_queries(seq)
-
-        # maybe multihead
-
+        normed_seq_for_queries = self.retrieve_norm(seq_for_queries)
+        queries = self.to_queries(normed_seq_for_queries)
         queries = self.split_heads(queries)
 
-        # maybe qk rmsnorm
+        if self.qk_l2norm:
+            queries = l2norm(queries)
+        elif self.qk_rmsnorm:
+            queries = self.q_norm_module(queries)
+        
+        queries_rearranged_for_chunking = rearrange(queries, 'b h (nq c) d -> (b h nq) c d', c=local_retrieve_chunk_size)
+        num_query_chunks_per_bh = queries.shape[2] // local_retrieve_chunk_size
 
-        queries = self.q_norm(queries)
+        if num_query_chunks_per_bh == 0 and original_retrieve_seq_len > 0 :
+             return torch.empty(batch, original_retrieve_seq_len, self.dim, device=seq.device, dtype=seq.dtype)
+        if num_query_chunks_per_bh == 0 and original_retrieve_seq_len == 0:
+             return torch.empty(batch, 0, self.dim, device=seq.device, dtype=seq.dtype)
 
-        # fetch values from memory model
+        weights_for_functional_call = weights.apply(
+            lambda t: repeat(t, 'bh ... -> (bh nq) ...', nq=num_query_chunks_per_bh) if t.numel() > 0 else t.expand(num_query_chunks_per_bh * t.shape[0], *t.shape[1:])
+        )
+        
+        def single_model_call_retrieve(params_single_set: Dict[str, Tensor], single_query_chunk_input: Tensor):
+            return functional_call(self.memory_model, params_single_set, (single_query_chunk_input,))
 
-        if weights_have_expanded_shape:
-            weights = rearrange_dict_values(weights, 'b n ... -> (b n) ...')
+        vmapped_model_call_retrieve = vmap(single_model_call_retrieve, in_dims=(0, 0))
 
-        queries = rearrange(queries, 'b h (n c) d -> (b h n) c d', c = chunk_size)
+        values_from_mem_model_chunked = vmapped_model_call_retrieve(
+            dict(weights_for_functional_call),
+            queries_rearranged_for_chunking
+        )
 
-        # forward functional call
+        values_from_mem_model = rearrange(values_from_mem_model_chunked,
+                                          '(b h nq) c d -> b h (nq c) d',
+                                          b=batch, h=self.heads, c=local_retrieve_chunk_size)
 
-        values = functional_call(self.memory_model, dict(weights), queries)
-
-        # reconstitute batch dimension
-
-        values = rearrange(values, '(b h n) c d -> b h (n c) d', b = batch, h = self.heads)
-
-        values = self.multihead_rmsnorm(values)
-
-        # maybe gate
+        values_from_mem_model = self.multihead_rmsnorm(values_from_mem_model)
 
         if exists(self.retrieve_gate):
-            values = values * self.retrieve_gate(seq)
+            gate_input_seq = original_seq_for_gate
+            if need_pad:
+                gate_input_seq = pad_at_dim(original_seq_for_gate, (0, padding_for_chunking), dim=1)
+            if gate_input_seq.shape[1] > 0:
+                gate_values = self.retrieve_gate(gate_input_seq)
+                values_from_mem_model = values_from_mem_model * gate_values
 
-        # maybe merge heads and combine
+        values_merged = self.merge_heads(values_from_mem_model)
+        final_values = self.combine_heads(values_merged)
 
-        values = self.merge_heads(values)
-
-        values = self.combine_heads(values)
-
-        # restore, pad with empty memory embed
-
-        if need_pad:
-            values = values[:, 1:]
-
-        return values[:, :seq_len]
+        return final_values[:, :original_retrieve_seq_len]
 
     def forward(
         self,
         seq,
-        store_seq = None,
+        store_seq_arg_external = None,
         state: NeuralMemState | None = None,
         detach_mem_state = False,
         prev_weights = None,
         store_mask: Tensor | None = None,
         return_surprises = False,
-        ttt_batch_size: int | None = None
+        ttt_batch_size: int | None = None,
+        disable_ttl: bool = False
     ):
-        is_multi_input = self.qkv_receives_diff_views
+        assert seq.ndim == 4, f"NeuralMemory expects a 4D input (views, b, n, d), got {seq.ndim}D"
+        num_views = seq.shape[0]
+        batch_dim_size = seq.shape[1]
 
-        # handle single token
+        primary_seq_3d_for_nm = seq[0]
+        keys_values_views_for_store_memories = None
+        if self.qkv_receives_diff_views and num_views > 1:
+            keys_values_views_for_store_memories = seq[1:]
+            if keys_values_views_for_store_memories.shape[0] == 0:
+                keys_values_views_for_store_memories = None
+        
+        retrieve_seq_3d = primary_seq_3d_for_nm
+        store_seq_base_3d = default(store_seq_arg_external, primary_seq_3d_for_nm)
 
-        if seq.ndim == 2 or (is_multi_input and seq.ndim == 3):
-            seq = rearrange(seq, '... b d -> ... b 1 d')
+        if isinstance(store_seq_base_3d, Tensor) and store_seq_base_3d.ndim == 2:
+            store_seq_base_3d = rearrange(store_seq_base_3d, 'b d -> b 1 d')
+        
+        initial_seq_index, initial_weights_td, cache_store_seq_tensor, initial_past_M_and_S_state_tuple, _, _ = \
+            default(state, NeuralMemState(0, None, None, None, None, False)) # Added default for new field
 
-        is_single_token = seq.shape[-2] == 1
+        current_weights_td = initial_weights_td
+        if not exists(current_weights_td):
+            current_weights_td = self.init_weights(batch_dim_size)
+        current_weights_td = TensorDict(current_weights_td)
 
-        # if different views for qkv, then
+        current_past_M_and_S_state_tuple = initial_past_M_and_S_state_tuple
+        if not exists(current_past_M_and_S_state_tuple):
+            current_past_M_and_S_state_tuple = (current_weights_td.clone(), self.init_momentum(batch_dim_size))
+        
+        current_M_for_next_batch_start, current_S_for_next_chunk_start = current_past_M_and_S_state_tuple
+        if not isinstance(current_M_for_next_batch_start, TensorDict): current_M_for_next_batch_start = TensorDict(current_M_for_next_batch_start)
+        if not isinstance(current_S_for_next_chunk_start, TensorDict): current_S_for_next_chunk_start = TensorDict(current_S_for_next_chunk_start)
+        current_past_M_and_S_state_tuple = (current_M_for_next_batch_start, current_S_for_next_chunk_start)
 
-        if is_multi_input:
-            retrieve_seq, seq = seq[0], seq[1:]
-        else:
-            retrieve_seq = seq
+        store_seq_input_3d = store_seq_base_3d
+        if exists(cache_store_seq_tensor) and cache_store_seq_tensor.numel() > 0 :
+            assert cache_store_seq_tensor.ndim == 3, "cache_store_seq must be 3D"
+            store_seq_input_3d = safe_cat((cache_store_seq_tensor, store_seq_input_3d), dim=1)
+        
+        assert store_seq_input_3d.ndim == 3, "store_seq_input_3d for splitting must be 3D"
+        current_call_store_seq_len = store_seq_input_3d.shape[1]
+        
+        batch_size_for_ttl_update = default(ttt_batch_size, self.batch_size)
+        
+        accumulated_M_values_over_call_chunks = None # Initialize to None
+        final_cache_store_segment_for_next_state = store_seq_input_3d
+        
+        final_M_after_call = current_M_for_next_batch_start
+        final_S_after_call = current_S_for_next_chunk_start
+        final_seq_index_after_call = initial_seq_index + current_call_store_seq_len
+        
+        all_chunk_surprises_list = []
+        memory_weights_actually_updated_this_call = False
 
-        # handle previous state init
+        if current_call_store_seq_len > 0 and not disable_ttl and exists(batch_size_for_ttl_update):
+            offset_in_store_seq = 0
+            temp_seq_idx_tracker = initial_seq_index
+            
+            weights_at_start_of_current_ttl_batch = current_M_for_next_batch_start.clone() 
+            momentum_at_start_of_current_ttl_batch_first_chunk = current_S_for_next_chunk_start
 
-        if not exists(state):
-            state = (0, None, None, None, None)
+            while offset_in_store_seq < current_call_store_seq_len:
+                current_pos_in_ttl_batch = temp_seq_idx_tracker % batch_size_for_ttl_update
+                len_to_fill_ttl_batch = batch_size_for_ttl_update - current_pos_in_ttl_batch
+                len_this_chunk = min(len_to_fill_ttl_batch, current_call_store_seq_len - offset_in_store_seq)
 
-        seq_index, weights, cache_store_seq, past_state, updates = state
+                store_chunk_iter = store_seq_input_3d[:, offset_in_store_seq : offset_in_store_seq + len_this_chunk, :]
+                
+                kv_views_chunk_iter = None
+                if exists(keys_values_views_for_store_memories) and keys_values_views_for_store_memories.shape[1] == current_call_store_seq_len:
+                    kv_views_chunk_iter = keys_values_views_for_store_memories[:, :, offset_in_store_seq : offset_in_store_seq + len_this_chunk, :]
 
-        # store
+                mask_chunk_iter = None
+                if exists(store_mask) and store_mask.shape[-1] == current_call_store_seq_len:
+                    mask_chunk_iter = store_mask[:, offset_in_store_seq : offset_in_store_seq + len_this_chunk]
+                
+                chunk_M_values, internal_next_state_from_chunk, chunk_surprises = self.store_memories(
+                    store_chunk_iter,
+                    keys_values_views_seq=kv_views_chunk_iter,
+                    weights=weights_at_start_of_current_ttl_batch,
+                    seq_index=temp_seq_idx_tracker,
+                    past_state=(weights_at_start_of_current_ttl_batch, momentum_at_start_of_current_ttl_batch_first_chunk),
+                    prev_weights=prev_weights,
+                    mask=mask_chunk_iter,
+                    return_surprises=True,
+                    disable_ttl=False 
+                )
+                
+                if chunk_M_values.keys(): # If store_memories returned updates
+                    accumulated_M_values_over_call_chunks = chunk_M_values # Only keep the latest
+                
+                all_chunk_surprises_list.append(chunk_surprises)
+                final_cache_store_segment_for_next_state = internal_next_state_from_chunk.cache_store_segment
+                
+                temp_seq_idx_tracker = internal_next_state_from_chunk.seq_index
+                final_M_after_chunk, final_S_after_chunk = internal_next_state_from_chunk.states
+                
+                if divisible_by(temp_seq_idx_tracker, batch_size_for_ttl_update):
+                    gate_val = self.transition_gate.sigmoid() if exists(self.transition_gate) else 1.0
+                    
+                    weights_at_start_of_current_ttl_batch = weights_at_start_of_current_ttl_batch.apply(
+                        lambda w_old, m_new: w_old.lerp(m_new, gate_val) if exists(gate_val) and gate_val != 1.0 else m_new,
+                        final_M_after_chunk
+                    )
+                    memory_weights_actually_updated_this_call = True 
+                    
+                    momentum_at_start_of_current_ttl_batch_first_chunk = final_S_after_chunk
+                else:
+                    momentum_at_start_of_current_ttl_batch_first_chunk = final_S_after_chunk
 
-        store_seq = default(store_seq, seq)
+                offset_in_store_seq += len_this_chunk
+            
+            final_M_after_call = weights_at_start_of_current_ttl_batch
+            final_S_after_call = momentum_at_start_of_current_ttl_batch_first_chunk
+            final_seq_index_after_call = temp_seq_idx_tracker
 
-        # take care of cache
-
-        if exists(cache_store_seq):
-            store_seq = safe_cat((cache_store_seq, store_seq))
-
-        # compute split sizes of sequence
-        # for now manually update weights to last update at the correct boundaries
-
-        store_seq_len, chunk_size, batch_size = store_seq.shape[-2], self.chunk_size, default(ttt_batch_size, self.batch_size)
-
-        need_update_weights = exists(batch_size)
-
-        # determine split sizes and when to update
-
-        if need_update_weights:
-            update_after_final_store = divisible_by(seq_index + store_seq_len, batch_size)
-
-            seq_range = torch.arange(store_seq_len) + seq_index + 1
-            batch_boundary = divisible_by(seq_range, batch_size)
-
-            indices = seq_range[batch_boundary] - seq_index
-
-            indices = F.pad(indices, (1, 0), value = 0)
-
-            if indices[-1] != store_seq_len:
-                indices = F.pad(indices, (0, 1), value = store_seq_len)
-
-            split_sizes = (indices[1:] - indices[:-1]).tolist()
-
-            assert sum(split_sizes) == store_seq_len
-        else:
-            split_sizes = (store_seq_len,)
-            update_after_final_store = False
-
-        # accumulate updates
-
-        updates = None
-
-        def accum_updates(past_updates, future_updates):
-            if not exists(past_updates):
-                return future_updates
-
-            return TensorDict({param_name: cat((past_update[:, :-1], future_update), dim = 1) for (param_name, past_update), (_, future_update) in zip(past_updates.items(), future_updates.items())})
-
-        # loop through chunks of store sequences
-
-        store_seqs = store_seq.split(split_sizes, dim = -2)
-
-        if exists(store_mask):
-            store_masks = store_mask.split(split_sizes, dim = -1)
-        else:
-            store_masks = (None,) * len(split_sizes)
-
-        # whether to allow network to slowly adjust from initial weight throughout (residual path) to fully updating weights every batch
-
-        surprises = (None, None)
-        gate = None
-
-        if exists(self.transition_gate):
-            gate = self.transition_gate.sigmoid()
-
-        for ind, (store_seq_chunk, maybe_store_mask) in enumerate(zip(store_seqs, store_masks)):
-            is_last = ind == (len(store_seqs) - 1)
-
-            # store
-
-            next_updates, next_neural_mem_state, chunk_surprises = self.store_memories(
-                store_seq_chunk,
-                weights,
-                seq_index = seq_index,
-                past_state = past_state,
-                prev_weights = prev_weights,
-                mask = maybe_store_mask,
-                return_surprises = True
+        elif current_call_store_seq_len > 0: 
+            chunk_M_values, internal_next_state_from_chunk, chunk_surprises = self.store_memories(
+                store_seq_input_3d, keys_values_views_seq=keys_values_views_for_store_memories,
+                weights=current_M_for_next_batch_start, seq_index=initial_seq_index,
+                past_state=(current_M_for_next_batch_start, current_S_for_next_chunk_start),
+                prev_weights=prev_weights, mask=store_mask, return_surprises=True,
+                disable_ttl=True 
             )
+            if chunk_M_values.keys():
+                accumulated_M_values_over_call_chunks = chunk_M_values # Only keep the latest
+            all_chunk_surprises_list.append(chunk_surprises)
+            final_cache_store_segment_for_next_state = internal_next_state_from_chunk.cache_store_segment
+            _, final_S_after_call = internal_next_state_from_chunk.states
+            final_seq_index_after_call = internal_next_state_from_chunk.seq_index
 
-            weights = next_neural_mem_state.weights
-            seq_index = next_neural_mem_state.seq_index
-            past_state = next_neural_mem_state.states
-
-            updates = accum_updates(updates, next_updates)
-
-            surprises = tuple(safe_cat(args, dim = -1) for args in zip(surprises, chunk_surprises))
-
-            if is_last and not update_after_final_store:
-                continue
-
-            # update weights once batch size is fulfilled
-
-            last_update, last_momentum = past_state
-
-            if exists(gate):
-                last_update = TensorDict({param_name: one_weight.lerp(one_last_update, gate) for (param_name, one_weight), (_, one_last_update) in zip(weights.items(), last_update.items())})
-
-            past_state = (last_update, last_momentum)
-
-            # set weights to the last updated weights for the last minibatch
-
-            weights = last_update
-
-            next_neural_mem_state = next_neural_mem_state._replace(
-                weights = weights,
-                states = past_state,
-            )
-
-        next_neural_mem_state = next_neural_mem_state._replace(updates = updates)
-
-        # retrieve
-
-        if is_single_token:
-            last_update, _ = next_neural_mem_state.states
-            updates = rearrange_dict_values(last_update, 'b ... -> b 1 ...')
-
-        retrieved = self.retrieve_memories(
-            retrieve_seq,
-            updates
+        final_output_state = NeuralMemState(
+             seq_index = final_seq_index_after_call,
+             weights = final_M_after_call,
+             cache_store_segment=final_cache_store_segment_for_next_state,
+             states = (final_M_after_call, final_S_after_call),
+             updates = accumulated_M_values_over_call_chunks,
+             memory_weights_updated_in_call = memory_weights_actually_updated_this_call
         )
 
-        # maybe detach
+        retrieved = self.retrieve_memories(
+            retrieve_seq_3d,
+            final_output_state.weights
+        )
 
         if detach_mem_state:
-            next_neural_mem_state = mem_state_detach(next_neural_mem_state)
-
-        # returning
+            final_output_state = mem_state_detach(final_output_state)
 
         if not return_surprises:
-            return retrieved, next_neural_mem_state
+            return retrieved, final_output_state
 
-        return retrieved, next_neural_mem_state, surprises
+        final_surprises_tuple = (None, None)
+        if all_chunk_surprises_list:
+             all_losses = [s[0] for s in all_chunk_surprises_list if exists(s) and exists(s[0]) and s[0].numel() > 0]
+             all_lrs = [s[1] for s in all_chunk_surprises_list if exists(s) and exists(s[1]) and s[1].numel() > 0]
+             
+             final_loss_tensor = cat(all_losses, dim=-1) if all_losses else torch.empty(batch_dim_size, self.heads, 0, device=retrieve_seq_3d.device, dtype=retrieve_seq_3d.dtype)
+             final_lr_tensor = cat(all_lrs, dim=-1) if all_lrs else torch.empty(batch_dim_size, self.heads, 0, device=retrieve_seq_3d.device, dtype=retrieve_seq_3d.dtype)
+
+             if final_loss_tensor.numel() > 0 or final_lr_tensor.numel() > 0 :
+                 final_surprises_tuple = (final_loss_tensor, final_lr_tensor)
+        
+        return retrieved, final_output_state, final_surprises_tuple

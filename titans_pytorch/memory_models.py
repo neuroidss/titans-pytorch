@@ -1,3 +1,5 @@
+# FILE: memory_models.py
+
 import torch
 from torch import nn, cat
 import torch.nn.functional as F
@@ -60,12 +62,26 @@ class MemoryMLP(Module):
     ):
         super().__init__()
         dim_hidden = int(dim * expansion_factor)
-        dims = (dim, *((dim_hidden,) * (depth - 1)), dim)
 
-        self.weights = ParameterList([Parameter(torch.randn(dim_in, dim_out)) for dim_in, dim_out in zip(dims[:-1], dims[1:])])
+        # Determine dimensions for each layer
+        dims_list = []
+        if depth == 1:
+            dims_list = [dim, dim]
+        elif depth > 1:
+            dims_list = [dim] + [dim_hidden] * (depth - 1) + [dim]
+        else:
+            raise ValueError("Depth must be at least 1")
 
-        for weight in self.weights:
-            nn.init.xavier_uniform_(weight)
+        self.weights = ParameterList()
+        for dim_in, dim_out in zip(dims_list[:-1], dims_list[1:]):
+            weight_matrix = Parameter(torch.empty(dim_in, dim_out)) # Use empty and init separately
+            if dim_in == dim_out: # If it's a square matrix, aim for identity-like
+                nn.init.eye_(weight_matrix)
+                # Optionally add small noise:
+                # weight_matrix.data.add_(torch.randn_like(weight_matrix) * 0.01)
+            else: # For non-square (expansion/contraction), use Xavier
+                nn.init.xavier_uniform_(weight_matrix)
+            self.weights.append(weight_matrix)
 
     def forward(
         self,
@@ -75,7 +91,7 @@ class MemoryMLP(Module):
             is_first = ind == 0
 
             if not is_first:
-                x = F.gelu(x)
+                x = F.gelu(x) # Apply activation before non-first layers
 
             x = x @ weight
 
@@ -103,8 +119,13 @@ class GatedResidualMemoryMLP(Module):
 
         self.final_proj = Parameter(torch.randn(dim, dim))
 
-        for param in self.parameters():
-            nn.init.xavier_uniform_(param)
+        # Initialize weights using Xavier Uniform
+        for param_list in self.weights:
+            nn.init.xavier_uniform_(param_list[0]) # weight1
+            nn.init.xavier_uniform_(param_list[1]) # weight2
+            nn.init.xavier_uniform_(param_list[2]) # to_gates
+        nn.init.xavier_uniform_(self.final_proj)
+
 
     def forward(
         self,
@@ -120,7 +141,8 @@ class GatedResidualMemoryMLP(Module):
 
             # gated residual
 
-            gates = cat((branch_out, res), dim = -1) @ to_gates
+            gates_input = cat((branch_out, res), dim = -1)
+            gates = gates_input @ to_gates
             x = res.lerp(branch_out, gates.sigmoid())
 
         return x @ self.final_proj
@@ -178,27 +200,35 @@ class MemorySwiGluMLP(Module):
         weights = []
 
         for _ in range(depth):
-            weights.append(ParameterList([
-                Parameter(torch.randn(dim, dim_inner * 2)),
-                Parameter(torch.randn(dim_inner, dim)),
-            ]))
+            # Define weights for one SwiGLU block
+            w1 = Parameter(torch.randn(dim, dim_inner * 2)) # Combined gate and value projection
+            w2 = Parameter(torch.randn(dim_inner, dim))     # Down projection
+            nn.init.xavier_uniform_(w1)
+            nn.init.xavier_uniform_(w2)
+            weights.append(ParameterList([w1, w2]))
 
         self.weights = ParameterList(weights)
-        self.norm = LayerNorm(dim)
+        self.norm = LayerNorm(dim) # Final layer norm
 
     def forward(self, x):
 
         for w1, w2 in self.weights:
             residual = x
 
-            x, gates = (x @ w1).chunk(2, dim = -1)
+            hidden_states = x @ w1
+            # Split into gate and value
+            x_val, gates = hidden_states.chunk(2, dim = -1)
 
-            x = x * F.gelu(gates)
+            # Apply SiLU activation (equivalent to Swish/SiLU GLU)
+            x = F.silu(gates) * x_val
 
+            # Project down
             x = x @ w2
 
+            # Add residual
             x = x + residual
 
+        # Apply final norm
         return self.norm(x)
 
 # improvised attention as memory module
@@ -233,6 +263,7 @@ class MemoryAttention(Module):
         k = l2norm(x @ wk)
         v = x @ wv
 
+        # Assuming causal attention is desired for memory update context
         attn_out = F.scaled_dot_product_attention(
             q, k, v,
             scale = self.scale,
@@ -242,7 +273,7 @@ class MemoryAttention(Module):
         # parallel attention + feedforward block
         # as in PaLM + Gpt-J
 
-        h = F.gelu(x @ ffw1)
+        h = F.gelu(x @ ffw1) # Use GELU as in original
         ff_out = h @ ffw2
 
         return attn_out + ff_out
